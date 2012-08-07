@@ -27,8 +27,12 @@ import           System.FilePath (splitDirectories, dropExtension, takeExtension
 import           System.Posix.Types (EpochTime)
 import           System.PosixCompat.Files (modificationTime, getFileStatus)
 import           System.Process (createProcess, proc, terminateProcess, readProcess,
-                                           waitForProcess, rawSystem, runInteractiveProcess)
-import           System.IO (hClose, hIsEOF, hGetLine, stdout, stderr, hPutStrLn)
+                                           waitForProcess, rawSystem, runInteractiveProcess,
+                                           ProcessHandle)
+import           System.IO (hClose, hIsEOF, hGetLine, stdout, stderr, hPutStrLn, hFlush)
+import           System.INotify
+import           Control.Concurrent.MVar
+import           System.CPUTime (getCPUTime)
 
 import Build (recompDeps, getDeps)
 
@@ -43,23 +47,112 @@ writeLock = do
 removeLock :: IO ()
 removeLock = try_ (removeFile lockFile)
 
+
+terminate :: ProcessHandle -> IO ()
+terminate ph = do
+    putStrLn "Stopping development server..."
+    -- writeLock
+    threadDelay 1000000
+    putStrLn "Terminating development server..."
+    terminateProcess ph
+    return ()
+notifyhandler :: INotify -> MVar (ProcessHandle,[WatchDescriptor])  -> String -> [String] -> [FilePath] -> Event -> IO ()
+notifyhandler inotify mvar cmd devArgs hsSourceDirs event = do
+    forkIO . try_ $ do
+        -- putStrLn $ "starting notifyhandler "++show event
+        pvar <- tryTakeMVar mvar
+        case pvar of
+            Nothing -> do
+                -- putStrLn "starting notifyhandler with Nothing"
+                return ()
+            Just (oph,oldwatchlist) -> do
+                    -- putStrLn "starting notifyhandler with ph,watchlist"
+                    terminate oph
+                    rmWatchList oldwatchlist
+                    watchlist <- mkWatchList inotify mvar cmd devArgs hsSourceDirs
+
+
+                    putStrLn "Rebuilding application..."
+
+                    recompDeps hsSourceDirs
+
+                    -- list <- getFileList hsSourceDirs
+                    exit <- rawSystemFilter cmd ["build"]
+                    -- exit <- return ExitSuccess
+
+                    case exit of
+                     ExitFailure _ -> putStrLn "Build failure, pausing..."
+                     _ -> do
+                           -- removeLock
+                           putStrLn $ "Starting development server: runghc " ++ L.unwords devArgs
+                           (_,_,_,ph) <- createProcess $ proc "runghc" devArgs
+                           putMVar mvar (ph,watchlist)
+                           -- putStrLn "waiting for process ph"
+                           -- ec <- waitForProcess ph
+                           -- putStrLn $ "Exit code: " ++ show ec
+                           -- Ex.throwTo watchTid (userError "process finished")
+
+    return ()
+
+mkWatchList :: INotify -> MVar (ProcessHandle,[WatchDescriptor]) -> String -> [String] -> [FilePath] -> IO [WatchDescriptor]
+mkWatchList inotify mvar cmd devArgs hsSourceDirs = do
+    (files, deps) <- getDeps hsSourceDirs
+    let files' = files ++ map fst (Map.toList deps)
+    list <- mapM (\p -> addWatch inotify [Modify] p (notifyhandler inotify mvar cmd devArgs hsSourceDirs)) files'
+    -- list <- mapM (\p -> addWatch inotify [Modify] p (\ev -> putStrLn "Notify Event")) files'
+    putStrLn "Created new watchlist "
+    -- putStrLn $ "Created new watchlist " ++ show files'
+    return list
+
+rmWatchList :: [WatchDescriptor] -> IO ()
+rmWatchList watchlist = do
+    putStrLn "Clearing watchlist"
+    mapM (removeWatch) watchlist
+    return ()
+
 devel :: Bool -> [String] -> IO ()
 devel isCabalDev passThroughArgs = do
     checkDevelFile
     writeLock
+    inotify <- initINotify
+    mvar <- newEmptyMVar
+
+    ghcVer <- ghcVersion
+    pkgArgs <- ghcPackageArgs isCabalDev ghcVer
+    devArgs <- return $ pkgArgs ++ ["devel.hs"] ++ passThroughArgs
+
+    cabal <- D.findPackageDesc "."
+    gpd   <- D.readPackageDescription D.normal cabal
+
+    hsSourceDirs <- checkCabalFile gpd
+
+    watchlist <- mkWatchList inotify mvar cmd devArgs hsSourceDirs
 
     putStrLn "Yesod devel server. Press ENTER to quit"
     _ <- forkIO $ do
-      cabal <- D.findPackageDesc "."
-      gpd   <- D.readPackageDescription D.normal cabal
-
-      hsSourceDirs <- checkCabalFile gpd
 
       _<- rawSystem cmd args
 
-      mainLoop hsSourceDirs
+      putStrLn "Create dummy process"
+      (_,_,_,ph) <- createProcess $ proc "sleep" ["500"]
+      putMVar mvar (ph,watchlist)
 
+      notifyhandler inotify mvar cmd devArgs hsSourceDirs Ignored
+      putStrLn "Exited main notifyhandler"
+      -- watchlist <- mkWatchList inotify mvar mph cmd devArgs hsSourceDirs
+      -- putMVar mvar watchlist
+
+      -- mainLoop hsSourceDirs INotify
+
+    putStrLn "wait for enter"
     _ <- getLine
+    pvar <- tryTakeMVar mvar
+    case pvar of
+        Nothing -> return ()
+        Just (fph,fwatchlist) -> do
+            terminate fph
+            rmWatchList fwatchlist
+    killINotify inotify
     writeLock
     exitSuccess
   where
@@ -76,38 +169,6 @@ devel isCabalDev passThroughArgs = do
             ]
     args = "configure":diffArgs ++ ["--disable-library-profiling" ]
 
-    mainLoop :: [FilePath] -> IO ()
-    mainLoop hsSourceDirs = do
-       ghcVer <- ghcVersion
-       when isCabalDev (rawSystemFilter cmd ["build"] >> return ())  -- cabal-dev fails with strange errors sometimes if we cabal-dev buildinfo before cabal-dev build
-       pkgArgs <- ghcPackageArgs isCabalDev ghcVer
-       let devArgs = pkgArgs ++ ["devel.hs"] ++ passThroughArgs
-       forever $ do
-           putStrLn "Rebuilding application..."
-
-           recompDeps hsSourceDirs
-
-           list <- getFileList hsSourceDirs
-           exit <- rawSystemFilter cmd ["build"]
-
-           case exit of
-             ExitFailure _ -> putStrLn "Build failure, pausing..."
-             _ -> do
-                   removeLock
-                   putStrLn $ "Starting development server: runghc " ++ L.unwords devArgs
-                   (_,_,_,ph) <- createProcess $ proc "runghc" devArgs
-                   watchTid <- forkIO . try_ $ do
-                         watchForChanges hsSourceDirs list
-                         putStrLn "Stopping development server..."
-                         writeLock
-                         threadDelay 1000000
-                         putStrLn "Terminating development server..."
-                         terminateProcess ph
-                   ec <- waitForProcess ph
-                   putStrLn $ "Exit code: " ++ show ec
-                   Ex.throwTo watchTid (userError "process finished")
-           watchForChanges hsSourceDirs list
-
 try_ :: forall a. IO a -> IO ()
 try_ x = (Ex.try x :: IO (Either Ex.SomeException a)) >> return ()
 
@@ -122,13 +183,6 @@ getFileList hsSourceDirs = do
         return $ case efs of
             Left (_ :: Ex.SomeException) -> (f, 0)
             Right fs -> (f, modificationTime fs)
-
-watchForChanges :: [FilePath] ->  FileList -> IO ()
-watchForChanges hsSourceDirs list = do
-    newList <- getFileList hsSourceDirs
-    if list /= newList
-      then return ()
-      else threadDelay 1000000 >> watchForChanges hsSourceDirs list
 
 checkDevelFile :: IO ()
 checkDevelFile = do
